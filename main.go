@@ -7,8 +7,11 @@ import (
 	"log"
 	"math"
 	"math/rand/v2"
+	"os"
 
 	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/audio"
+	"github.com/hajimehoshi/ebiten/v2/audio/wav"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"github.com/hajimehoshi/ebiten/v2/text/v2"
 	"github.com/hajimehoshi/ebiten/v2/vector"
@@ -17,6 +20,8 @@ import (
 
 // 1.  A controllable player
 // 2. bakground for space (stars )
+const sampleRate = 48000
+
 type Stars struct {
 	X, Y float32
 }
@@ -39,18 +44,23 @@ type Alien struct {
 	health byte
 	dying  bool
 	fade   float32 // 1.0 -> fully visible, 0.0 -> invisible
+	scream *audio.Player
 }
 
 const starRadius = 2.0
 
 type Game struct {
-	isStarted  bool
-	restart    bool
-	frontStars []Stars
-	backStars  []Stars
-	player     Player
-	aliens     []Alien
-	missile    []Stars
+	isStarted       bool
+	restart         bool
+	frontStars      []Stars
+	backStars       []Stars
+	player          Player
+	aliens          []Alien
+	missile         []Stars
+	audioContext    *audio.Context
+	backGroundMusic *audio.Player
+	shootSound      *audio.Player
+	collisionSound  *audio.Player
 }
 
 const width = 680
@@ -142,8 +152,9 @@ func (g *Game) Update() error {
 }
 
 func (g *Game) fireMissile() {
-	// g.player.isFiring = false
 	g.missile = append(g.missile, Stars{X: float32(g.player.X), Y: g.player.Y})
+	g.shootSound.Rewind()
+	g.shootSound.Play()
 }
 
 func (g *Game) alienSpeen() int {
@@ -372,21 +383,20 @@ func (g *Game) Surf() {
 		spawnNumber := rand.IntN(maxAliensCount + 1)
 		for i := 0; i < spawnNumber && len(g.aliens) < maxAliensCount; i++ {
 			horizontalSpwanPoint := float32(rand.IntN(width-200) + 100)
-			alien := Alien{X: horizontalSpwanPoint, Y: -50, health: 100, dying: false, fade: 1.0}
+			alienScream := loadSound(g.audioContext, "alienDies.wav")
+			alienScream.SetVolume(5)
+			alien := Alien{X: horizontalSpwanPoint, Y: -50, health: 100, dying: false, fade: 1.0, scream: alienScream}
 
 			// log.Printf("Creating alien at X: %.2f, Y: %.2f\n", alien.X, alien.Y)
 			g.aliens = append(g.aliens, alien)
 			// log.Printf("Total aliens created: %d\n", len(g.aliens))
 		}
-
-		// for _, alien := range g.aliens {
-		// 	allAlienXPoints = append(allAlienXPoints, alien.X)
-		// }
 	}
 
 	for i := 0; i < len(g.aliens); i++ {
 		g.aliens[i].Y += float32(g.alienSpeen())
 		if g.aliens[i].Y > height {
+			// alien dies
 			g.aliens = append(g.aliens[:i], g.aliens[i+1:]...)
 		}
 	}
@@ -398,12 +408,14 @@ func (g *Game) Surf() {
 			//
 			if math.Abs(float64(player.Y-a.Y)) < 10 {
 				isCollision := false
-				if (player.X > a.X && player.X-a.X < 80) || (player.X < a.X && a.X-player.X < 10) {
+				if (player.X > a.X && player.X-a.X < 50) || (player.X < a.X && a.X-player.X < 20) {
 					isCollision = true
 				}
 
 				if isCollision {
 					g.restart = true
+					g.collisionSound.Rewind()
+					g.collisionSound.Play()
 					g.restartGame()
 				}
 			}
@@ -435,8 +447,11 @@ func (g *Game) Surf() {
 				g.aliens[i].fade -= 0.05 // fade speed per tick
 				if g.aliens[i].fade <= 0 {
 					// remove alien
+					g.aliens[i].scream.Rewind()
+					g.aliens[i].scream.Play()
 					g.player.score += 1
 					g.aliens = append(g.aliens[:i], g.aliens[i+1:]...)
+
 				}
 			}
 		}
@@ -452,14 +467,59 @@ var (
 	mplusFaceSource *text.GoTextFaceSource
 )
 
+func loadSound(audioContext *audio.Context, path string) *audio.Player {
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	d, err := wav.DecodeWithSampleRate(sampleRate, f)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	player, err := audioContext.NewPlayer(d)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return player
+}
+
+func loadLoopingMusic(audioContext *audio.Context, path string) *audio.Player {
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	d, err := wav.DecodeWithSampleRate(sampleRate, f)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	loopStream := audio.NewInfiniteLoop(d, d.Length())
+
+	player, err := audioContext.NewPlayer(loopStream)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return player
+}
+
 func main() {
 	s, _ := text.NewGoTextFaceSource(bytes.NewReader(goregular.TTF))
+	audioContext := audio.NewContext(sampleRate)
 	mplusFaceSource = s
 
 	game := &Game{}
 
+	game.audioContext = audioContext
 	ebiten.SetWindowSize(width, height)
 	ebiten.SetWindowTitle("My Pixel Plane Game")
+	game.shootSound = loadSound(audioContext, "shoot.wav")
+	game.collisionSound = loadSound(audioContext, "collision.wav")
+	game.backGroundMusic = loadLoopingMusic(audioContext, "backgroundMusic.wav")
+
+	game.backGroundMusic.SetVolume(0.3)
+	game.backGroundMusic.Play()
+	game.collisionSound.SetVolume(100.0)
 
 	game.player.X = float32(width / 2)
 	game.player.Y = float32(height * 0.8)
