@@ -2,12 +2,12 @@ package main
 
 import (
 	"bytes"
+	_ "embed"
 	"fmt"
 	"image/color"
 	"log"
 	"math"
 	"math/rand/v2"
-	"os"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/audio"
@@ -20,7 +20,7 @@ import (
 
 // 1.  A controllable player
 // 2. bakground for space (stars )
-const sampleRate = 48000
+const sampleRate = 8000
 
 type Stars struct {
 	X, Y float32
@@ -44,7 +44,6 @@ type Alien struct {
 	health byte
 	dying  bool
 	fade   float32 // 1.0 -> fully visible, 0.0 -> invisible
-	scream *audio.Player
 }
 
 const starRadius = 2.0
@@ -61,6 +60,8 @@ type Game struct {
 	backGroundMusic *audio.Player
 	shootSound      *audio.Player
 	collisionSound  *audio.Player
+	alienDiesSound  *audio.Player
+	planeImage      *ebiten.Image // Cached plane image
 }
 
 const width = 680
@@ -136,6 +137,30 @@ func (g *Game) Update() error {
 
 	}
 
+	// Touch screen support
+	// touchIDs := []ebiten.TouchID{}
+	touchIDs := inpututil.JustPressedTouchIDs()
+	for _, id := range touchIDs {
+		fmt.Println(id)
+		tx, ty := ebiten.TouchPosition(id)
+		// Click on plane to shoot
+		if math.Abs(float64(float32(tx)-player.X)) < 100 && math.Abs(float64(float32(ty)-player.Y)) < 100 {
+			g.player.isFiring = true
+			g.fireMissile()
+			if !g.isStarted {
+				g.isStarted = true
+				g.restart = false
+				g.player.score = 0
+			}
+		} else if tx < width/2 && player.X-float32(player.planeSizeX) > 0 {
+			// Touch left side to move left
+			player.X -= float32(player.speed * 5)
+		} else if tx >= width/2 && player.X+float32(player.planeSizeX) < width {
+			// Touch right side to move right
+			player.X += float32(player.speed * 5)
+		}
+	}
+
 	if inpututil.IsKeyJustPressed(ebiten.KeySpace) {
 		// This runs only once until the key is released and pressed again
 		g.player.isFiring = true
@@ -153,12 +178,14 @@ func (g *Game) Update() error {
 
 func (g *Game) fireMissile() {
 	g.missile = append(g.missile, Stars{X: float32(g.player.X), Y: g.player.Y})
-	g.shootSound.Rewind()
-	g.shootSound.Play()
+	if g.shootSound != nil && !g.shootSound.IsPlaying() {
+		g.shootSound.Rewind()
+		g.shootSound.Play()
+	}
 }
 
 func (g *Game) alienSpeen() int {
-	return 3
+	return 1
 }
 
 var incr = 0
@@ -195,7 +222,7 @@ func (g *Game) drawStars(screen *ebiten.Image) {
 	for _, s := range g.backStars {
 		vector.FillCircle(screen, float32(s.X), float32(s.Y), starRadius, color.White, false)
 	}
-	const frontStarsSpeed = 5.0
+	const frontStarsSpeed = 3.0
 	const backStarsSpeed = 1.0
 
 	for i := range g.frontStars {
@@ -220,6 +247,11 @@ func (g *Game) drawStars(screen *ebiten.Image) {
 			g.missile = append(g.missile[:i], g.missile[i+1:]...)
 		}
 	}
+
+	// Limit missiles to prevent performance issues
+	if len(g.missile) > 10 {
+		g.missile = g.missile[len(g.missile)-10:]
+	}
 }
 
 func (g *Game) drawPlayerPlane(screen *ebiten.Image) {
@@ -228,7 +260,7 @@ func (g *Game) drawPlayerPlane(screen *ebiten.Image) {
 	op := &ebiten.DrawImageOptions{}
 	op.GeoM.Scale(float64(g.player.scale), float64(g.player.scale))
 	op.GeoM.Translate(float64(player.X)-(3*12), float64(player.Y))
-	screen.DrawImage(g.createPlaneImage(), op)
+	screen.DrawImage(g.planeImage, op) // Use cached image
 
 	for _, mis := range g.missile {
 		// missileOp = 		alienOp := &ebiten.DrawImageOptions{}
@@ -379,13 +411,11 @@ func (g *Game) Surf() {
 
 	// current tick count
 	tick := ebiten.Tick()
-	if tick%45 == 0 {
-		spawnNumber := rand.IntN(maxAliensCount + 1)
+	if tick%90 == 0 { // Further reduced spawn rate
+		spawnNumber := rand.IntN(2) + 1 // Spawn 1-2 aliens max
 		for i := 0; i < spawnNumber && len(g.aliens) < maxAliensCount; i++ {
 			horizontalSpwanPoint := float32(rand.IntN(width-200) + 100)
-			alienScream := loadSound(g.audioContext, "alienDies.wav")
-			alienScream.SetVolume(5)
-			alien := Alien{X: horizontalSpwanPoint, Y: -50, health: 100, dying: false, fade: 1.0, scream: alienScream}
+			alien := Alien{X: horizontalSpwanPoint, Y: -50, health: 100, dying: false, fade: 1.0}
 
 			// log.Printf("Creating alien at X: %.2f, Y: %.2f\n", alien.X, alien.Y)
 			g.aliens = append(g.aliens, alien)
@@ -396,7 +426,7 @@ func (g *Game) Surf() {
 	for i := 0; i < len(g.aliens); i++ {
 		g.aliens[i].Y += float32(g.alienSpeen())
 		if g.aliens[i].Y > height {
-			// alien dies
+			// alien is out of screen
 			g.aliens = append(g.aliens[:i], g.aliens[i+1:]...)
 		}
 	}
@@ -447,8 +477,10 @@ func (g *Game) Surf() {
 				g.aliens[i].fade -= 0.05 // fade speed per tick
 				if g.aliens[i].fade <= 0 {
 					// remove alien
-					g.aliens[i].scream.Rewind()
-					g.aliens[i].scream.Play()
+					if g.alienDiesSound != nil {
+						g.alienDiesSound.Rewind()
+						g.alienDiesSound.Play()
+					}
 					g.player.score += 1
 					g.aliens = append(g.aliens[:i], g.aliens[i+1:]...)
 
@@ -467,12 +499,20 @@ var (
 	mplusFaceSource *text.GoTextFaceSource
 )
 
-func loadSound(audioContext *audio.Context, path string) *audio.Player {
-	f, err := os.Open(path)
-	if err != nil {
-		log.Fatal(err)
-	}
-	d, err := wav.DecodeWithSampleRate(sampleRate, f)
+//go:embed shoot.wav
+var shootWav []byte
+
+//go:embed collision.wav
+var collisionWav []byte
+
+//go:embed backgroundMusic.wav
+var backgroundMusicWav []byte
+
+//go:embed alienDies.wav
+var alienDiesWav []byte
+
+func loadSound(audioContext *audio.Context, data []byte) *audio.Player {
+	d, err := wav.DecodeWithSampleRate(sampleRate, bytes.NewReader(data))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -484,12 +524,8 @@ func loadSound(audioContext *audio.Context, path string) *audio.Player {
 	return player
 }
 
-func loadLoopingMusic(audioContext *audio.Context, path string) *audio.Player {
-	f, err := os.Open(path)
-	if err != nil {
-		log.Fatal(err)
-	}
-	d, err := wav.DecodeWithSampleRate(sampleRate, f)
+func loadLoopingMusic(audioContext *audio.Context, data []byte) *audio.Player {
+	d, err := wav.DecodeWithSampleRate(sampleRate, bytes.NewReader(data))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -513,33 +549,41 @@ func main() {
 	game.audioContext = audioContext
 	ebiten.SetWindowSize(width, height)
 	ebiten.SetWindowTitle("My Pixel Plane Game")
-	game.shootSound = loadSound(audioContext, "shoot.wav")
-	game.collisionSound = loadSound(audioContext, "collision.wav")
-	game.backGroundMusic = loadLoopingMusic(audioContext, "backgroundMusic.wav")
+
+	ebiten.SetTPS(30)
+	game.shootSound = loadSound(audioContext, shootWav)
+	game.collisionSound = loadSound(audioContext, collisionWav)
+	game.alienDiesSound = loadSound(audioContext, alienDiesWav)
+	game.backGroundMusic = loadLoopingMusic(audioContext, backgroundMusicWav)
 
 	game.backGroundMusic.SetVolume(0.3)
 	game.backGroundMusic.Play()
-	game.collisionSound.SetVolume(100.0)
+	game.collisionSound.SetVolume(100) // Fixed: was 100.0
+	game.alienDiesSound.SetVolume(0.8)
 
 	game.player.X = float32(width / 2)
 	game.player.Y = float32(height * 0.8)
 	game.player.scale = 4
 	game.player.planeSizeX = 12
 	game.player.planeSizeY = 16
-	game.player.speed = 5
+	game.player.speed = 6
 	game.player.score = 0
 
-	for x := 0; x <= width; x += 10 {
-		for y := 0; y <= height; y += 10 {
-			if showStar := rand.IntN(500); showStar == 1 {
+	// Cache the plane image (created once, not every frame)
+	game.planeImage = game.createPlaneImage()
+
+	// Drastically reduced star count for WebAssembly performance
+	for x := 0; x <= width; x += 30 {
+		for y := 0; y <= height; y += 30 {
+			if showStar := rand.IntN(20); showStar == 1 {
 				game.frontStars = append(game.frontStars, Stars{X: float32(x), Y: float32(y)})
 			}
 		}
 	}
 
-	for x := 0; x <= width; x += 50 {
-		for y := 0; y <= height; y += 50 {
-			if showStar := rand.IntN(50); showStar == 1 {
+	for x := 0; x <= width; x += 100 {
+		for y := 0; y <= height; y += 100 {
+			if showStar := rand.IntN(10); showStar == 1 {
 				game.backStars = append(game.backStars, Stars{X: float32(x), Y: float32(y)})
 			}
 		}
